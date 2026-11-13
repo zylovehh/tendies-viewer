@@ -468,13 +468,38 @@ struct WebView: UIViewRepresentable {
         //   二进制 ArrayBuffer 而不是 base64 字符串），真机上就会对不上，
         //   需要按网页侧实际代码把下面解析处逐项改对，不要在交付里说成已对齐。
         private struct ExportTransfer {
+            var id: String = "default"
             var filename: String
             var chunks: [Int: Data] = [:]
             var lastIndex: Int?
             var total: Int?
+            var type: String = "chunk"
+            // 预览视频的保存目录（Documents 下的子文件夹名，用户在网页设置里填）：
+            // 有值就直接存到 Documents/<saveDir>/，不弹分享单；空着走老路（临时目录 + 分享单）。
+            var saveDir: String = ""
         }
 
         private var exportTransfers: [String: ExportTransfer] = [:]
+
+        // 导出结果回写给网页：window.__tendiesExportResult(id, ok, message)。
+        // 网页侧等这个回调再显示“已保存”，不再凭“发出去了”就报已保存。
+        private func replyExportResult(id: String, ok: Bool, message: String) {
+            guard let webView = hostWebView else { return }
+            let safeId = id.replacingOccurrences(of: "'", with: "")
+            let safeMsg = message
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "'", with: "\\'")
+                .replacingOccurrences(of: "\n", with: " ")
+            webView.evaluateJavaScript("window.__tendiesExportResult && window.__tendiesExportResult('\(safeId)', \(ok ? "true" : "false"), '\(safeMsg)')", completionHandler: nil)
+        }
+
+        // 目录名只留安全字符，防止网页给的路径写到别处。
+        private func sanitizedDirName(_ raw: String) -> String {
+            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ .·、"))
+            let cleaned = raw.unicodeScalars.filter { allowed.contains($0) }.map { String($0) }.joined()
+            let trimmed = cleaned.trimmingCharacters(in: .whitespaces)
+            return trimmed.isEmpty ? "预览视频" : trimmed
+        }
 
         // MARK: - WKScriptMessageHandler
 
@@ -690,9 +715,14 @@ struct WebView: UIViewRepresentable {
             let filename = sanitizedFilename(
                 (dict["filename"] as? String) ?? (dict["name"] as? String)
             )
+            // 网页侧导出用 "data"（编辑器 ExportDialog），查看器保存视频曾用 "dataBase64"，
+            // 这里两种都认，否则视频块会被当成“没有数据”直接报“数据不完整”。
             let base64 = (dict["data"] as? String)
                 ?? (dict["chunk"] as? String)
                 ?? (dict["base64"] as? String)
+                ?? (dict["dataBase64"] as? String)
+            // 预览视频的保存目录（网页设置里填的文件夹名），跟块一起带过来。
+            let saveDir = (dict["saveDir"] as? String) ?? ""
 
             // complete：data 即整包，直接拼包分享，不走分块。
             if type == "complete" {
@@ -727,8 +757,11 @@ struct WebView: UIViewRepresentable {
                 return
             }
 
-            var transfer = exportTransfers[id] ?? ExportTransfer(filename: filename)
+            var transfer = exportTransfers[id] ?? ExportTransfer(id: id, filename: filename)
+            transfer.id = id
             transfer.filename = filename
+            transfer.type = type
+            if !saveDir.isEmpty { transfer.saveDir = saveDir }
             if let total = total { transfer.total = total }
             if let base64 = base64, let index = index {
                 // 去重：同一 index 只保留第一次收到的块，重复块直接忽略。
@@ -764,7 +797,7 @@ struct WebView: UIViewRepresentable {
                 }
                 decoded[index] = data
             }
-            finalizeBridgeChunks(ExportTransfer(filename: filename, chunks: decoded, lastIndex: 0, total: 1))
+            finalizeBridgeChunks(ExportTransfer(id: id, filename: filename, chunks: decoded, lastIndex: 0, total: 1))
         }
 
         private func finalizeBridgeChunks(_ transfer: ExportTransfer) {
@@ -802,7 +835,27 @@ struct WebView: UIViewRepresentable {
             let isMp4 = assembled.count >= 8 && Array(assembled[4..<8]) == ftypMagic
             guard isZip || isWallive1 || isMp4 else {
                 showBridgeError("导出的数据不是有效的壁纸包或视频，请再点一次。")
+                replyExportResult(id: transfer.id, ok: false, message: "数据不是有效的壁纸包或视频")
                 return
+            }
+            // 预览视频 + 用户设了保存目录：直接存到 Documents/<目录>/ 文件名，
+            // 不弹分享单。Documents 在“文件”里看得到（已开 UIFileSharingEnabled）。
+            if transfer.type == "preview-video", !transfer.saveDir.isEmpty,
+               let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                let dirName = sanitizedDirName(transfer.saveDir)
+                let dir = docs.appendingPathComponent(dirName)
+                let dest = dir.appendingPathComponent(transfer.filename)
+                do {
+                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                    try? FileManager.default.removeItem(at: dest)
+                    try assembled.write(to: dest, options: .atomic)
+                    replyExportResult(id: transfer.id, ok: true, message: "\(dirName)/\(transfer.filename)")
+                    return
+                } catch {
+                    showBridgeError("视频保存失败，请再点一次。")
+                    replyExportResult(id: transfer.id, ok: false, message: "视频保存失败")
+                    return
+                }
             }
             let dest = FileManager.default.temporaryDirectory
                 .appendingPathComponent(transfer.filename)
@@ -811,8 +864,10 @@ struct WebView: UIViewRepresentable {
                 try assembled.write(to: dest, options: .atomic)
             } catch {
                 showBridgeError("壁纸文件保存失败，请再点一次“导出 .tendies”。")
+                replyExportResult(id: transfer.id, ok: false, message: "文件保存失败")
                 return
             }
+            replyExportResult(id: transfer.id, ok: true, message: transfer.filename)
             presentShareSheet(for: dest, deleteAfterSharing: true)
         }
 
