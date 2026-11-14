@@ -64,6 +64,7 @@ struct WebView: UIViewRepresentable {
         // 网页侧按这个名字找，拼写差一个字母网页就会判定桥不存在而走回退路。
         config.userContentController.add(context.coordinator, name: "tendiesExport")
         config.userContentController.add(context.coordinator, name: "tendiesLocal")
+        config.userContentController.add(context.coordinator, name: "tendiesShare")
 
         // cap 协议必须在 WKWebView 创建前注册：WKWebView 创建时拷贝配置，
         // 创建后再往 config 里加 handler 对已建好的 webView 不生效，cap:// 请求
@@ -511,6 +512,8 @@ struct WebView: UIViewRepresentable {
             DispatchQueue.main.async { [weak self] in
                 if message.name == "tendiesLocal" {
                     self?.handleTendiesLocal(message.body, webView: message.webView)
+                } else if message.name == "tendiesShare" {
+                    self?.handleTendiesShare(message.body)
                 } else {
                     self?.handleTendiesExport(message.body)
                 }
@@ -968,6 +971,53 @@ struct WebView: UIViewRepresentable {
                 sheet.completionWithItemsHandler = { _, _, _, _ in
                     try? FileManager.default.removeItem(at: url)
                 }
+            }
+            present(sheet)
+        }
+
+        // MARK: - 分享到壁纸匣（tendiesShare）：网页点“分享”时发项目号和文件名过来，
+        // 原生直接从沙盒 Projects/<项目号>/ 里读原包和预览视频，弹系统分享单。
+        // 文件名用壁纸名 + 后缀，分享单里看着清楚；临时文件分享完就删。
+        private func handleTendiesShare(_ body: Any) {
+            guard let dict = body as? [String: Any],
+                  let projectId = dict["projectId"] as? String,
+                  let tendiesFile = dict["tendiesFile"] as? String,
+                  let name = dict["name"] as? String
+            else { return }
+            guard let base = localBaseDir() else { return }
+            let safeProject = projectId.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+            guard !safeProject.isEmpty else { return }
+            let projectDir = base.appendingPathComponent(safeProject)
+            let tendiesURL = projectDir.appendingPathComponent(tendiesFile)
+            guard FileManager.default.fileExists(atPath: tendiesURL.path) else { return }
+
+            let safeName = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: "\\", with: "-")
+            let tmpDir = FileManager.default.temporaryDirectory
+            var items: [URL] = []
+            var tmpFiles: [URL] = []
+            let tendiesTmp = tmpDir.appendingPathComponent("\(safeName).tendies")
+            try? FileManager.default.removeItem(at: tendiesTmp)
+            if (try? FileManager.default.copyItem(at: tendiesURL, to: tendiesTmp)) != nil {
+                items.append(tendiesTmp)
+                tmpFiles.append(tendiesTmp)
+            } else {
+                return
+            }
+            if let videoFile = dict["videoFile"] as? String {
+                let videoURL = projectDir.appendingPathComponent(videoFile)
+                if FileManager.default.fileExists(atPath: videoURL.path) {
+                    let videoTmp = tmpDir.appendingPathComponent("\(safeName).mp4")
+                    try? FileManager.default.removeItem(at: videoTmp)
+                    if (try? FileManager.default.copyItem(at: videoURL, to: videoTmp)) != nil {
+                        items.append(videoTmp)
+                        tmpFiles.append(videoTmp)
+                    }
+                }
+            }
+            let sheet = UIActivityViewController(activityItems: items, applicationActivities: nil)
+            sheet.excludedActivityTypes = [.assignToContact]
+            sheet.completionWithItemsHandler = { _, _, _, _ in
+                for f in tmpFiles { try? FileManager.default.removeItem(at: f) }
             }
             present(sheet)
         }
