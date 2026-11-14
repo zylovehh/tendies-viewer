@@ -1017,7 +1017,12 @@ struct WebView: UIViewRepresentable {
             let sheet = UIActivityViewController(activityItems: items, applicationActivities: nil)
             sheet.excludedActivityTypes = [.assignToContact]
             sheet.completionWithItemsHandler = { _, _, _, _ in
-                for f in tmpFiles { try? FileManager.default.removeItem(at: f) }
+                // 晚 60 秒再删：系统把文件拷到目标 App 需要时间，分享单刚关就删，
+                // 第二个文件（预览视频）可能还没拷完就没了，目标 App 只收到包。
+                // 临时文件很小，晚删一分钟没影响；App 被杀没删掉的话系统自己会清临时目录。
+                DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
+                    for f in tmpFiles { try? FileManager.default.removeItem(at: f) }
+                }
             }
             present(sheet)
         }
